@@ -2,6 +2,8 @@ const express = require("express");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const session = require("express-session");
+const MongoDbStore = require("connect-mongodb-session")(session);
 const { format, parse } = require("date-fns");
 const app = express();
 const port = 8080;
@@ -43,28 +45,48 @@ app.use(
     credentials: true,
   })
 );
+// save session in db
+const store = new MongoDbStore({
+  uri: process.env.CONNECTION_STRING,
+  collections: "sessions",
+});
+
+app.use(
+  session({
+    secret: "mysecret",
+    resave: false,
+    saveUninitialized: false,
+    store: store,
+  })
+);
 
 // registering user endpoint
-app.post("/register", (req, res) => {
-  let user = req.body;
-  console.log(user)
-  bcrypt.genSalt(10, (err, salt) => {
-    if (!err) {
-      bcrypt.hash(user.password, salt, async (err, hashPass) => {
-        if (!err) {
-          user.password = hashPass;
-          try {
-            let doc = await userModel.create(user);
-            res.send({ message: "User was registered" });
-            console.log("User was registered");
-          } catch (err) {
-            console.log("error creating user", err);
-            res.status(500).send({ message: "Error creating user" });
-          }
-        }
-      });
+app.post("/register", async (req, res) => {
+  try {
+    let user = req.body;
+
+    // Check if the user with the given email already exists
+    const userFound = await userModel.findOne({ email: user.email });
+
+    if (userFound) {
+      return res.status(409).json({ message: "User already registered" });
     }
-  });
+
+    // Hash the password
+    const hashPass = await bcrypt.hash(user.password, 10);
+
+    // Update user's password with the hashed password
+    user.password = hashPass;
+
+    // Create the user
+    const createdUser = await userModel.create(user);
+
+    res.send({ message: "User was registered" });
+    console.log("User was registered");
+  } catch (error) {
+    console.error("Error registering user:", error);
+    res.status(500).send({ message: "Error creating user" });
+  }
 });
 
 // endpoint for login
@@ -73,33 +95,36 @@ app.post("/login", async (req, res) => {
   try {
     const user = await userModel.findOne({ email: userCred.email });
 
-    const { password, otherUserData } = user;
-
     if (user) {
-      const passwordMatch = await bcrypt.compare(
-        userCred.password,
-        user.password
-      );
+      const { password, _id, name, age, email } = user;
+      const passwordMatch = await bcrypt.compare(userCred.password, password);
 
       if (passwordMatch) {
-        let token = jwt.sign(otherUserData, "jwtkey");
-        // res.send({ message: "Login Successful" });
+        let token = jwt.sign({ id: _id.toString() }, "jwtkey");
+
         if (token) {
-          res.send({ message: "Login Successful", token: token });
+          req.session.login = { token: token, userId: _id.toString() };
+          return res.status(200).send({
+            message: "Login successful",
+            userInfo: { userId: _id.toString(), name, age, email },
+          });
         } else {
-          res.send({ message: "Error by generating the token" });
+          return res.status(500).send({
+            message: "Unable to generate token",
+          });
         }
       } else {
-        res.status(403).send({ message: "Incorrect Password" });
+        return res.status(401).send({ message: "Password is incorrect" });
       }
     } else {
-      res.status(404).send({ message: "User not found" });
+      return res.status(404).send({ message: "User not found" });
     }
   } catch (err) {
-    console.log("Error by logging the user");
-    res.send({ message: "Error by logging the user" });
+    console.error("Error by logging the user", err);
+    return res.status(500).send({ message: "Error by logging the user" });
   }
 });
+
 //  endpoint to see all foods
 app.get("/foods", verifytoken, async (req, res) => {
   let foods = await foodModel.find();
@@ -173,8 +198,44 @@ app.get("/track/:userId/:date", verifytoken, async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.send({ message: "Hello welcome"})
-})
+  res.send({ message: "Hello welcome" });
+});
+
+app.post("/addfood", async (req, res) => {
+  const admId = "65b55ce0ef83a5b883760033";
+  const userId = req.session.login.userId;
+  const { name, calories, carbohydrates, fat, protein, fiber } = req.body;
+
+  if (userId !== admId) {
+    return res.status(401).send({ message: "User not Authorized to add food" });
+  }
+
+  try {
+    const existingFood = await foodModel.findOne({
+      name: { $regex: name, $options: "i" },
+    });
+
+    if (existingFood) {
+      return res
+        .status(400)
+        .send({ message: "Food with this name already exists." });
+    }
+
+    const food = await foodModel.create({
+      name,
+      calories,
+      carbohydrates,
+      fat,
+      protein,
+      fiber,
+    });
+
+    res.send({ message: "Food added successfully" });
+  } catch (err) {
+    console.log(err);
+    res.status(500).send({ message: "Error by adding food" });
+  }
+});
 
 app.listen(port, () => {
   console.log("listening on port " + port);
